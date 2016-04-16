@@ -1,165 +1,162 @@
+import mimetypes
 import os
 import socket
 
 
-class BrowserRequest(object):
-    """Represents a browser request
+class BrowserRequest():
 
-    Userful parameters include:
-    request.verb         -- GET, POST, HEAD, etc
-    request.path         -- /path/to/file.html
-    request.http_version -- HTTP
-    request.user_agent   -- Mozilla/5.0 (Macintosh; Intel Mac OS X 10_6_8) Ap..
-    """
-
-    def __init__(self, text):
-        self.info = {}
-        lines = [r.strip() for r in text.split("\n")]
+    def __init__(self, data: bytes):
+        lines = [d.strip() for d in data.decode().split("\n") if d.strip()]
 
         # First line takes the form of
         # GET /file/path/ HTTP/1.1
-        action = lines.pop(0).split(" ")
-        self.info['verb'] = action[0]  # GET, POST, etc
-        if os.path.basename(action[1]) == "":
-            self.info['path'] = os.path.join(action[1], 'index.html')
-        else:
-            self.info['path'] = action[1]
-        self.info['http_version'] = action[0]
+        self.method, self.path, self.http_version = lines.pop(0).split(" ")
+        self.info = {k: v for k, v in (l.split(': ') for l in lines)}
 
-        for line in lines:
-            i = line.find(':')
-            var = line[:i].strip().lower().replace('-', '_')
-            val = line[i + 1:].strip()
-            self.info[var] = val
+    def __repr__(self) -> str:
+        return "<BrowserRequest {method} {path} {http_version}>".format(
+            method=self.method, path=self.path, http_version=self.http_version)
 
-    def __getattr__(self, attr):
-        return self.info.get(attr)
+    def __getattr__(self, name: str):
+        try:
+            return self.info["-".join([n.capitalize() for n in name.split('_')])]
+        except IndexError:
+            raise AttributeError(name)
 
 
-class ServerSocketError(Exception):
-    pass
-
-
-class ServerSocket(object):
+class ServerSocket():
     """Simplified interface for interacting with a web server socket"""
 
-    def __init__(self, host='', port=80, buffer_size=1024,
-            max_queued_connections=5):
-        self.is_open = False
-        self.client_conn = None
-        self.server_conn = None
+    def __init__(self, host='', port=80, buffer_size=1024, max_queued_connections=5):
+        self._connection = None
+        self._socket = None
         self.host = host
-        self.port = int(port)
+        self.port = port
         self.buffer_size = buffer_size
         self.max_queued_connections = max_queued_connections
 
+    def __repr__(self) -> str:
+        status = 'closed' if self._socket is None else 'open'
+        return "<{status} ServerSocket {host}:{port}>".format(
+            status=status, host=self.host, port=self.port)
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def open(self):
-        if self.is_open:
-            raise ServerSocketError('Socket is already open')
-
-        self.server_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_conn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_conn.bind((self.host, self.port))
-        self.server_conn.listen(self.max_queued_connections)
-        self.is_open = True
-
-    def recieve(self, buffer_size=None):
-        self.close_open_client_connections()
-        self.client_conn, _ = self.server_conn.accept()
-        return self.client_conn.recv(buffer_size or self.buffer_size)
-
-    def send(self, data=None):
-        if not self.client_conn:
-            raise ServerSocketError('No client connection open for sending')
-        for d in data:
-            self.client_conn.send(d)
-
-    def close_open_client_connections(self):
-        if self.client_conn:
-            self.client_conn.close()
-            self.client_conn = None
+        assert self._socket is None, "ServerSocket is already open"
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self._socket.bind((self.host, self.port))
+        except:
+            self.close()
+            raise
+        else:
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     def close(self):
-        self.close_open_client_connections()
-        self.server_conn.close()
-        self.is_open = False
+        assert self._socket is not None, "ServerSocker is already closed"
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+        self._socket.close()
+        self._socket = None
+
+    def listen(self) -> BrowserRequest:
+        assert self._socket is not None, "ServerSocker must be open to listen data"
+        self._socket.listen(self.max_queued_connections)
+        self._connection, _ = self._socket.accept()
+        data = self._connection.recv(self.buffer_size)
+        return BrowserRequest(data)
+
+    def respond(self, data: bytes):
+        assert self._socket is not None, "ServerSocker must be open to respond"
+        self._connection.send(data)
+        self._connection.close()
 
 
-class SimpleServer(object):
+class SimpleServer():
     """A Simple webserver implemented in Python. NOT FOR PRODUCTION USE"""
 
     STATUSES = {
-        200: 'OK',
+        200: 'Ok',
         404: 'File not found',
     }
-    default_404 = '<html><h1>404 File Not Found</h1></html>'
+    response_404 = '<html><h1>404 File Not Found</h1></html>'
+    log_format = "{status_code} - {method} {path} {user_agent}"
 
-    def __init__(self, port=80, homedir='./', page404=None):
-        """Initialize a webserver
+    def __init__(self, port=80, homedir=os.path.curdir, page404=None):
+        """
+        Initialize a webserver
 
         port    -- port to server requests from
         homedir -- path to serve files out of
         page404 -- optional path to HTML file for 404 errors
         """
-
         self.socket = ServerSocket(port=port)
         self.homedir = os.path.abspath(homedir)
-        self.page404 = page404
+        if page404:
+            with open(page404) as f:
+                self.response_404 = f.read()
 
-    def log(self, msg):
-        """Logs a message. By default, prints to the screen but this
-        could be overwritten to write to a file, etc
-        """
-        print msg
-
-    def log_request(self, status, request):
-        self.log("{status} - {verb} {path} {user_agent}".format(
-                status=status, verb=request.verb,
-                path=self.get_requested_path(request),
-                user_agent=request.user_agent))
-
-    def start(self):
-        self.log("Listening on port {0}, serving files in {1}".format(
-                self.port, self.homedir))
-        self.socket.open()
+    def log(self, msg: str):
+        print(msg)
 
     def serve(self):
-        if not self.socket.is_open:
-            self.start()
-
-        request = self.socket.recieve()
-        if request:
-            request = BrowserRequest(request)
-            status, data = self.process_request(request)
-            self.log_request(status, request)
-            self.socket.send(data)
-        return request
-
-    def serve_forever(self):
+        self.socket.open()
+        self.log('Opening socket connection {}:{} in {}'.format(
+            self.socket.host, self.socket.port, self.homedir))
         while True:
-            self.serve()
-
-    def process_request(self, request):
-        requested_file = self.get_requested_path(request)
-        if os.path.exists(requested_file):
-            status = 200
-            data = (self.get_header(status), open(requested_file).read())
-            return (status, data)
-        else:
-            status = 404
-            html = open(self.page404).read() if self.page404 else self.default_404
-            data = (self.get_header(status), html)
-            return (status, data)
-
-    def get_header(self, code):
-        return "HTTP/1.0 {0} {1}\n\n".format(code, self.STATUSES[code])
-
-    def get_requested_path(self, request):
-        path = request.path
-        if path[0] == '/':
-            path = path[1:]
-        return os.path.join(self.homedir, path)
+            self.serve_request()
 
     def stop(self):
-        self.log('Shutting down server')
         self.socket.close()
+
+    def serve_request(self):
+        request = self.socket.listen()
+        path = request.path
+        try:
+            body, status_code = self.load_file(path)
+        except IsADirectoryError:
+            path = os.path.join(path, 'index.html')
+            body, status_code = self.load_file(path)
+
+        header = self.get_header(status_code, path)
+        self.socket.respond((header + body).encode())
+        self.log(self.log_format.format(status_code=status_code,
+                                        method=request.method,
+                                        path=request.path,
+                                        user_agent=request.user_agent))
+
+    def get_header(self, status_code: int, path: str):
+        _, file_ext = os.path.splitext(path)
+        return "\n".join([
+            "HTTP/1.1 {} {}".format(status_code, self.STATUSES[status_code]),
+            "Content-Type: {}".format(mimetypes.types_map.get(file_ext, 'application/octet-stream')),
+            "Server: SimplePython Server"
+            "\n\n"
+        ])
+
+    def load_file(self, path):        
+        try:
+            with open(os.path.join(self.homedir, path.lstrip('/'))) as f:
+                return f.read(), 200
+        except FileNotFoundError:
+            return self.response_404, 404
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Runs a simple Python server. Not for production')
+    parser.add_argument('port', type=int, help='port to run the server on')
+    args = parser.parse_args()
+    server = SimpleServer(args.port)
+    try:
+        server.serve()
+    finally:
+        server.stop()
